@@ -8,89 +8,76 @@ from datetime import datetime
 from enum import Enum
 from configparser import ConfigParser
 
-LOGGER = logging.getLogger(__name__)
-CLRF = "\r\n"
+from uter.commands import *
+from uter.messages import *
+from uter.handlers.default import *
+from uter.handlers.ameno import *
 
-MESSAGE_INFO = {
-	'unparsed': {},
-	'message': {'identifier': 'PRIVMSG'},
-	'motd': {'identifier': '372'},
-	'end_motd': {'identifier': '376'},
-	'welcome': {'identifier': '001'},
-	'ping': {}
-}
+LOGGER = logging.getLogger(__name__)
+
+CRLF = "\r\n"
 
 CONFIG = ConfigParser()
 CONFIG.read('uter/default.cfg')
 
-MessageType = Enum('MessageType', list(MESSAGE_INFO.keys()))
+class BaseHandler:
+	def __init__(self, check=None, execute=None):
+		self.methods = {
+			'check'  : check or (lambda _: True),
+			'execute': execute or (lambda _: None)
+		}
 
-IDENTIFIER_TO_TYPE = dict((v['identifier'], MessageType[k]) for k, v in MESSAGE_INFO.items() if 'identifier' in v)
-
-print(MessageType)
-print(IDENTIFIER_TO_TYPE)
-
-class MessageParser:
-	def parse_type(type_string):
-		return IDENTIFIER_TO_TYPE.get(type_string, MessageType.unparsed)
-
-	def parse_sender(sender_string):
-		return sender_string
-
-	def parse_message(message):
-		result = {'time':datetime.now(), 'raw_message':message, 'message_type':MessageType.unparsed}
-
-		splitted = message.split()
-
-		if (splitted[0] == "PING"):
-			result.update(message_type=MessageType.ping, time=datetime.now(), sender=splitted[1])
-		elif (message[0] == ":"):
-			result.update(message_type=MessageParser.parse_type(splitted[1]), sender=MessageParser.parse_sender(splitted[0][1:]))
-
-		return result
+	def accept(self, message):
+		if self.methods['check'](message):
+			return self.methods['execute'](message)
+		else:
+			return None
 
 class IRCProtocol(asyncio.Protocol):
-	def _user(self, username, mode=[], realname=''):
-		self.quote("USER {0} 0 * :{1}".format(username, realname))
-
-	def _nick(self, nick):
-		self.quote("NICK {0}".format(nick))
-
-	def _join(self, channel):
-		self.quote("JOIN {0}".format(channel))
-
-	def _pong(self):
-		self.quote("PONG")
-
 	def quote(self, message):
-		print(">> {0}".format(message))
-		self.transport.write("{0}{1}".format(message, CLRF).encode())
+		print(">> {0}".format(message.strip()))
+		self.transport.write(message.encode())
+
+	def add(self, command):
+		self.quote(command.quote())
+
+	def add_all(self, commands):
+		if commands is None:
+			return
+		elif isinstance(commands, Command):
+			self.add(commands)
+		else:
+			for command in commands:
+				self.add(command)
 
 	def __init__(self, loop):
 		self.loop = loop
+		self.handlers = [
+			BaseHandler(lambda m: PingMessage in m.types, lambda m: PongCommand()),
+			BaseHandler(lambda m: WelcomeMessage in m.types, lambda m: JoinCommand(CONFIG["Basic"]["AutoJoinChannels"].split())),
+			JoinPartHandler()
+		]
 
 	def connection_made(self, transport):
 		print('Connection established')
 		self.transport = transport
 
-
 		name = CONFIG["Basic"]["BotName"]
-		self._user(name, [], name)
-		self._nick(name)
+
+		self.add(UserCommand(name))
+		self.add(NickCommand(name))
 
 	def data_received(self, data):
-		for line in data.decode().split(CLRF):
+		for line in data.decode().split(CRLF):
 				if (line.strip() != ""):
-					self.handle(MessageParser.parse_message(line))
+					msg = parse_message(line)
+					if (msg is not None):
+						self.handle(msg)
 
 	def handle(self, message):
-		print('<< {0}'.format(message))
-		if (message['message_type'] is MessageType.welcome):
-			for channel in CONFIG["Basic"]["AutoJoinChannels"].split():
-				self._join(channel)
-		elif (message['message_type'] is MessageType.ping):
-			self._pong()
-		
+		print(message.raw)
+		for handler in self.handlers:
+			self.add_all(handler.accept(message))
 
 	def connection_lost(self, exc):
 		print('The server closed the connection')
